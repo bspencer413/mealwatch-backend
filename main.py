@@ -27,7 +27,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 USDA_FDC_KEY = os.environ.get("USDA_FDC_KEY", "")
 
-API_VERSION = "0.1.4"
+API_VERSION = "0.1.6"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 INGEST_WINDOW_DAYS = 90
@@ -59,6 +59,11 @@ def init_db():
     try:
         with get_db() as conn:
             c = conn.cursor()
+            # pg_trgm enables fuzzy similarity for /suggest endpoint (v0.1.6+)
+            try:
+                c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            except Exception as ex:
+                print("[init_db] pg_trgm note: " + str(ex))
             c.execute("""CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
                 email TEXT UNIQUE NOT NULL,
@@ -395,6 +400,37 @@ async def search(q: str = ""):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="Search failed: " + str(e))
+
+
+@app.get("/suggest")
+async def suggest(q: str = ""):
+    """Return up to 5 distinct brand strings from recalls that fuzzily match q.
+    Uses pg_trgm similarity. For 'Resar' → suggests 'Reser's Fine Foods, Inc.'
+    Used by frontend when /search returns zero results."""
+    q = (q or "").strip()
+    if len(q) < 2:
+        return {"query": q, "suggestions": []}
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            # similarity threshold 0.2 catches transposed letters and short typos.
+            # Aggregate by lowercased brand to avoid duplicate casing variants.
+            c.execute("""SELECT brand, MAX(similarity(LOWER(brand), LOWER(%s))) AS sim
+                FROM recalls
+                WHERE brand IS NOT NULL AND brand <> ''
+                  AND similarity(LOWER(brand), LOWER(%s)) > 0.2
+                GROUP BY brand
+                ORDER BY sim DESC
+                LIMIT 5""", (q, q))
+            rows = c.fetchall()
+            sugg = []
+            for row in rows:
+                sugg.append({"brand": row["brand"], "score": float(row["sim"])})
+            return {"query": q, "suggestions": sugg}
+    except Exception as e:
+        # if pg_trgm not available, return empty rather than 500
+        print("[suggest] " + str(e))
+        return {"query": q, "suggestions": [], "note": "trigram unavailable"}
 
 
 # ── WATCHLIST MODELS ──────────────────────────────────────────────────────────
