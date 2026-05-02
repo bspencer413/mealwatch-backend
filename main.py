@@ -9,8 +9,11 @@ import json
 import bcrypt
 import jwt
 import requests
+import threading
+import time as time_mod
+import schedule
 from contextlib import contextmanager
-from typing import Optional
+from typing import Optional, List
 
 # ── DB CREDS (hardcoded, MW pattern) ──────────────────────────────────────────
 DB_HOST = "dpg-d7r4tdmgvqtc73b9p0qg-a.oregon-postgres.render.com"
@@ -24,10 +27,11 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 USDA_FDC_KEY = os.environ.get("USDA_FDC_KEY", "")
 
-API_VERSION = "0.1.3"
+API_VERSION = "0.1.4"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 INGEST_WINDOW_DAYS = 90
+WATCHLIST_CHECK_INTERVAL_HOURS = 12  # free tier; premium will be 1hr
 
 app = FastAPI(title="Mealwatch API", version=API_VERSION)
 
@@ -393,11 +397,322 @@ async def search(q: str = ""):
         raise HTTPException(status_code=500, detail="Search failed: " + str(e))
 
 
+# ── WATCHLIST MODELS ──────────────────────────────────────────────────────────
+class WatchlistAddIn(BaseModel):
+    brand: str
+    product_name: Optional[str] = None
+    upc: Optional[str] = None
+    monitoring: bool = True  # True = Watchlist; False = Pantry (saved, no alerts)
+
+
+class WatchlistMoveIn(BaseModel):
+    monitoring: bool
+
+
+# ── WATCHLIST HELPERS ─────────────────────────────────────────────────────────
+def find_best_recall_for_watch(conn, brand, product_name, upc):
+    """Return best matching recall row for a watch entry, or None.
+    Checks UPC first (exact), then brand+product (fuzzy via ILIKE + scoring)."""
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    # UPC exact match (when both have it)
+    if upc:
+        c.execute("SELECT * FROM recalls WHERE upc = %s LIMIT 1", (upc,))
+        row = c.fetchone()
+        if row:
+            return dict(row)
+    # Brand-based fuzzy
+    if brand:
+        like = "%" + brand + "%"
+        c.execute("""SELECT * FROM recalls
+            WHERE brand ILIKE %s OR product_description ILIKE %s
+            ORDER BY recall_date DESC NULLS LAST LIMIT 50""", (like, like))
+        rows = c.fetchall()
+        best = None
+        best_score = 0
+        for row in rows:
+            d = dict(row)
+            s = 0
+            b = (d.get("brand") or "").lower()
+            desc = (d.get("product_description") or "").lower()
+            br = (brand or "").lower()
+            pn = (product_name or "").lower()
+            if br and br in b:
+                s = s + (50 if b == br else 30)
+            if pn and pn in desc:
+                s = s + 20
+            elif pn and pn in b:
+                s = s + 10
+            if (d.get("classification") or "").startswith("I"):
+                s = s + 5
+            # require brand to actually match — don't surface unrelated recalls
+            if br and br not in b and br not in desc:
+                continue
+            if s > best_score:
+                best_score = s
+                best = d
+        # threshold for "this is a real match"
+        if best and best_score >= 30:
+            return best
+    return None
+
+
+def serialize_recall(d):
+    """Make a recall dict JSON-safe."""
+    if not d:
+        return None
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
+# ── WATCHLIST CRUD ────────────────────────────────────────────────────────────
+@app.get("/watchlist")
+async def list_watchlist(user=Depends(require_user)):
+    """Return all active watchlist entries for the current user."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("""SELECT id, brand, product_name, upc, monitoring, has_recall,
+                last_recall_id, last_checked, created_at
+                FROM watchlist
+                WHERE user_id = %s AND status = 'active'
+                ORDER BY created_at DESC""", (user["user_id"],))
+            rows = c.fetchall()
+            out = []
+            for row in rows:
+                d = dict(row)
+                if d.get("last_checked"):
+                    d["last_checked"] = d["last_checked"].isoformat()
+                if d.get("created_at"):
+                    d["created_at"] = d["created_at"].isoformat()
+                out.append(d)
+            return {"items": out, "count": len(out)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="List watchlist failed: " + str(e))
+
+
+@app.post("/watchlist")
+async def add_watchlist(body: WatchlistAddIn, user=Depends(require_user)):
+    """Add a new entry. monitoring=True → Watchlist; False → Pantry."""
+    brand = (body.brand or "").strip()
+    if not brand:
+        raise HTTPException(status_code=400, detail="brand is required")
+    product_name = (body.product_name or "").strip() or None
+    upc = (body.upc or "").strip() or None
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            # de-dupe: same user + brand + product_name + upc + active
+            c.execute("""SELECT id FROM watchlist
+                WHERE user_id = %s AND brand = %s
+                AND COALESCE(product_name,'') = COALESCE(%s,'')
+                AND COALESCE(upc,'') = COALESCE(%s,'')
+                AND status = 'active'""",
+                (user["user_id"], brand, product_name, upc))
+            existing = c.fetchone()
+            if existing:
+                return {"id": existing[0], "duplicate": True}
+            kind = "brand" if not product_name and not upc else "product"
+            c.execute("""INSERT INTO watchlist (user_id, kind, brand, product_name, upc, monitoring)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                (user["user_id"], kind, brand, product_name, upc, body.monitoring))
+            new_id = c.fetchone()[0]
+            conn.commit()
+            return {"id": new_id, "monitoring": body.monitoring, "duplicate": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Add watchlist failed: " + str(e))
+
+
+@app.delete("/watchlist/{item_id}")
+async def delete_watchlist(item_id: int, user=Depends(require_user)):
+    """Soft-delete a watchlist entry (status='deleted') and clear notifications."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id FROM watchlist WHERE id = %s AND user_id = %s",
+                      (item_id, user["user_id"]))
+            if not c.fetchone():
+                raise HTTPException(status_code=404, detail="Not found")
+            c.execute("UPDATE watchlist SET status = 'deleted' WHERE id = %s", (item_id,))
+            c.execute("DELETE FROM notifications WHERE watchlist_id = %s", (item_id,))
+            conn.commit()
+            return {"deleted": item_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Delete failed: " + str(e))
+
+
+@app.patch("/watchlist/{item_id}/move")
+async def move_watchlist(item_id: int, body: WatchlistMoveIn, user=Depends(require_user)):
+    """Toggle monitoring flag. True = Watchlist (alerts on); False = Pantry (alerts off)."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id FROM watchlist WHERE id = %s AND user_id = %s AND status = 'active'",
+                      (item_id, user["user_id"]))
+            if not c.fetchone():
+                raise HTTPException(status_code=404, detail="Not found")
+            c.execute("UPDATE watchlist SET monitoring = %s WHERE id = %s",
+                      (body.monitoring, item_id))
+            # if moved to Pantry, clear stale notifications for this item
+            if body.monitoring is False:
+                c.execute("DELETE FROM notifications WHERE watchlist_id = %s", (item_id,))
+            conn.commit()
+            return {"id": item_id, "monitoring": body.monitoring}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Move failed: " + str(e))
+
+
+@app.get("/watchlist/{item_id}/refresh")
+async def refresh_watchlist_item(item_id: int, user=Depends(require_user)):
+    """On-demand recheck for a single watchlist item — used by the drawer."""
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("""SELECT id, brand, product_name, upc, monitoring
+                FROM watchlist WHERE id = %s AND user_id = %s AND status = 'active'""",
+                (item_id, user["user_id"]))
+            wrow = c.fetchone()
+            if not wrow:
+                raise HTTPException(status_code=404, detail="Not found")
+            best = find_best_recall_for_watch(conn, wrow["brand"], wrow["product_name"], wrow["upc"])
+            now = datetime.utcnow()
+            has_recall = best is not None
+            last_recall_id = best["recall_id"] if best else None
+            uc = conn.cursor()
+            uc.execute("""UPDATE watchlist
+                SET has_recall = %s, last_recall_id = %s, last_checked = %s
+                WHERE id = %s""", (has_recall, last_recall_id, now, item_id))
+            conn.commit()
+            return {
+                "id": item_id,
+                "has_recall": has_recall,
+                "recall": serialize_recall(best),
+                "last_checked": now.isoformat()
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Refresh failed: " + str(e))
+
+
+# ── NOTIFICATIONS ─────────────────────────────────────────────────────────────
+@app.get("/notifications")
+async def list_notifications(user=Depends(require_user)):
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("""SELECT n.id, n.watchlist_id, n.message, n.email_sent, n.created_at,
+                w.brand, w.product_name, w.last_recall_id
+                FROM notifications n
+                LEFT JOIN watchlist w ON w.id = n.watchlist_id
+                WHERE n.user_id = %s
+                ORDER BY n.created_at DESC""", (user["user_id"],))
+            rows = c.fetchall()
+            out = []
+            for row in rows:
+                d = dict(row)
+                if d.get("created_at"):
+                    d["created_at"] = d["created_at"].isoformat()
+                out.append(d)
+            return {"items": out, "count": len(out)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="List notifications failed: " + str(e))
+
+
+@app.delete("/notifications/{notif_id}")
+async def delete_notification(notif_id: int, user=Depends(require_user)):
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM notifications WHERE id = %s AND user_id = %s",
+                      (notif_id, user["user_id"]))
+            conn.commit()
+            return {"deleted": notif_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Delete notification failed: " + str(e))
+
+
+# ── CRON: WATCHLIST CHECK ─────────────────────────────────────────────────────
+def run_watchlist_check():
+    """Iterate active watchlist rows where monitoring=True. For each, find best
+    matching recall. On a false→true transition, write a notification."""
+    print("[cron] watchlist check starting at " + datetime.utcnow().isoformat())
+    checked = 0
+    new_alerts = 0
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("""SELECT id, user_id, brand, product_name, upc, has_recall, last_recall_id
+                FROM watchlist WHERE status = 'active' AND monitoring = TRUE""")
+            rows = c.fetchall()
+            for w in rows:
+                checked = checked + 1
+                best = find_best_recall_for_watch(conn, w["brand"], w["product_name"], w["upc"])
+                now = datetime.utcnow()
+                has_recall_now = best is not None
+                new_recall_id = best["recall_id"] if best else None
+                uc = conn.cursor()
+                uc.execute("""UPDATE watchlist
+                    SET has_recall = %s, last_recall_id = %s, last_checked = %s
+                    WHERE id = %s""",
+                    (has_recall_now, new_recall_id, now, w["id"]))
+                # Notification trigger: flipped from no-match to match,
+                # OR same match-state but a different recall_id appeared
+                fire = False
+                if has_recall_now and not w["has_recall"]:
+                    fire = True
+                elif has_recall_now and new_recall_id and new_recall_id != w["last_recall_id"]:
+                    fire = True
+                if fire and best:
+                    label = w["brand"] or ""
+                    if w["product_name"]:
+                        label = label + " " + w["product_name"]
+                    msg = "Recall match for " + label.strip() + ": " + (
+                        best.get("reason") or best.get("product_description") or "see details"
+                    )[:240]
+                    uc.execute("""INSERT INTO notifications (user_id, watchlist_id, message)
+                        VALUES (%s, %s, %s)""", (w["user_id"], w["id"], msg))
+                    new_alerts = new_alerts + 1
+                conn.commit()
+        print("[cron] watchlist check done — checked=" + str(checked) + " new_alerts=" + str(new_alerts))
+    except Exception as e:
+        print("[cron] watchlist check error: " + str(e))
+
+
+def run_scheduler():
+    """Background thread — runs `schedule` jobs forever."""
+    schedule.every(WATCHLIST_CHECK_INTERVAL_HOURS).hours.do(run_watchlist_check)
+    # also do a fresh recall ingest every 6hr so cron has fresh data
+    schedule.every(6).hours.do(ingest_openfda)
+    while True:
+        schedule.run_pending()
+        time_mod.sleep(60)
+
+
+@app.post("/admin/run-watchlist-check")
+async def admin_run_watchlist_check(_admin=Depends(require_admin)):
+    """Manual trigger of the watchlist check (also runs on cron)."""
+    run_watchlist_check()
+    return {"status": "ok", "ts": datetime.utcnow().isoformat()}
+
+
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    print("Mealwatch API v" + API_VERSION + " started")
+    t = threading.Thread(target=run_scheduler, daemon=True)
+    t.start()
+    print("Mealwatch API v" + API_VERSION + " started (cron thread up)")
 
 
 if __name__ == "__main__":
