@@ -24,7 +24,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 USDA_FDC_KEY = os.environ.get("USDA_FDC_KEY", "")
 
-API_VERSION = "0.1.1"
+API_VERSION = "0.1.2"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 INGEST_WINDOW_DAYS = 90
@@ -222,15 +222,20 @@ def ingest_openfda(window_days=INGEST_WINDOW_DAYS):
     cutoff = (datetime.utcnow() - timedelta(days=window_days)).strftime("%Y%m%d")
     today = datetime.utcnow().strftime("%Y%m%d")
     url = "https://api.fda.gov/food/enforcement.json"
-    params = {"search": "report_date:[" + cutoff + "+TO+" + today + "]", "limit": 1000}
+    # NOTE: openFDA needs literal '+TO+' in the search string. Build URL manually
+    # since requests will URL-encode the '+' as '%2B' if passed via params.
+    search_str = "report_date:[" + cutoff + "+TO+" + today + "]"
+    full_url = url + "?search=" + search_str + "&limit=1000"
     if OPENFDA_KEY:
-        params["api_key"] = OPENFDA_KEY
+        full_url = full_url + "&api_key=" + OPENFDA_KEY
+    headers = {"User-Agent": "Mozilla/5.0 (mealwatch/0.1.2)"}
     inserted = 0
     skipped = 0
     try:
-        r = requests.get(url, params=params, timeout=30)
+        r = requests.get(full_url, headers=headers, timeout=30)
         if r.status_code != 200:
-            return {"source": "openfda", "error": "HTTP " + str(r.status_code), "inserted": 0}
+            return {"source": "openfda", "error": "HTTP " + str(r.status_code),
+                    "url": full_url[:200], "body": r.text[:300], "inserted": 0}
         data = r.json()
         results = data.get("results", [])
         with get_db() as conn:
@@ -271,9 +276,14 @@ def ingest_fsis(window_days=INGEST_WINDOW_DAYS):
     inserted = 0
     skipped = 0
     try:
-        r = requests.get(url, timeout=30)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json"
+        }
+        r = requests.get(url, headers=headers, timeout=30)
         if r.status_code != 200:
-            return {"source": "fsis", "error": "HTTP " + str(r.status_code), "inserted": 0}
+            return {"source": "fsis", "error": "HTTP " + str(r.status_code),
+                    "body": r.text[:300], "inserted": 0}
         data = r.json()
         with get_db() as conn:
             c = conn.cursor()
