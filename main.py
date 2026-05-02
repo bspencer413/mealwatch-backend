@@ -24,7 +24,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 USDA_FDC_KEY = os.environ.get("USDA_FDC_KEY", "")
 
-API_VERSION = "0.1.2"
+API_VERSION = "0.1.3"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 INGEST_WINDOW_DAYS = 90
@@ -326,7 +326,9 @@ def ingest_fsis(window_days=INGEST_WINDOW_DAYS):
 @app.post("/admin/refresh-recalls")
 async def admin_refresh_recalls(_admin=Depends(require_admin)):
     fda_res = ingest_openfda()
-    fsis_res = ingest_fsis()
+    # FSIS disabled in v0.1.3 — Akamai blocks server-side requests.
+    # Plan: re-enable via RSS feed in v0.2.
+    fsis_res = {"source": "fsis", "status": "disabled", "note": "deferred to v0.2"}
     return {"fda": fda_res, "fsis": fsis_res, "ts": datetime.now().isoformat()}
 
 
