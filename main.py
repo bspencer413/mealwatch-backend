@@ -27,7 +27,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 USDA_FDC_KEY = os.environ.get("USDA_FDC_KEY", "")
 
-API_VERSION = "0.1.7"
+API_VERSION = "0.1.8"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 INGEST_WINDOW_DAYS = 90
@@ -429,7 +429,7 @@ async def suggest(q: str = ""):
                     ) t
                     WHERE LENGTH(token) >= 2
                 ) s
-                WHERE sim > 0.35
+                WHERE sim > 0.3
                 GROUP BY brand
                 ORDER BY sim DESC
                 LIMIT 5
