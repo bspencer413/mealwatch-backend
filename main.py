@@ -27,7 +27,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 USDA_FDC_KEY = os.environ.get("USDA_FDC_KEY", "")
 
-API_VERSION = "0.1.8"
+API_VERSION = "0.1.9"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 INGEST_WINDOW_DAYS = 90
@@ -442,6 +442,35 @@ async def suggest(q: str = ""):
     except Exception as e:
         print("[suggest] " + str(e))
         return {"query": q, "suggestions": [], "note": "trigram unavailable"}
+
+
+@app.get("/recalls/recent")
+async def recent_recalls(limit: int = 25):
+    """Most recent FDA recalls, Class I + II only (the dangerous ones).
+    Sorted by recall_date descending. Used by the Search page 'Latest recalls' view."""
+    if limit < 1: limit = 1
+    if limit > 100: limit = 100
+    try:
+        with get_db() as conn:
+            c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            c.execute("""SELECT id, source, recall_id, brand, product_description, upc,
+                    classification, reason, recall_date, distribution, lot_codes,
+                    status, fetched_at
+                FROM recalls
+                WHERE classification IN ('I', 'II', 'Class I', 'Class II')
+                  OR classification ILIKE 'I' OR classification ILIKE 'II'
+                ORDER BY recall_date DESC NULLS LAST
+                LIMIT %s""", (limit,))
+            rows = c.fetchall()
+            out = []
+            for row in rows:
+                d = dict(row)
+                if d.get("fetched_at"):
+                    d["fetched_at"] = d["fetched_at"].isoformat()
+                out.append(d)
+            return {"count": len(out), "results": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Recent recalls failed: " + str(e))
 
 
 # ── WATCHLIST MODELS ──────────────────────────────────────────────────────────
