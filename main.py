@@ -27,7 +27,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 USDA_FDC_KEY = os.environ.get("USDA_FDC_KEY", "")
 
-API_VERSION = "0.1.9"
+API_VERSION = "0.1.10"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 INGEST_WINDOW_DAYS = 90
@@ -582,13 +582,16 @@ async def add_watchlist(body: WatchlistAddIn, user=Depends(require_user)):
     try:
         with get_db() as conn:
             c = conn.cursor()
-            # de-dupe: same user + brand + product_name + upc + active
+            # de-dupe: same user + brand + product_name + upc + monitoring + active.
+            # Allows same item to live on Watchlist AND Pantry simultaneously
+            # (different monitoring values), but blocks two identical rows on the same list.
             c.execute("""SELECT id FROM watchlist
                 WHERE user_id = %s AND brand = %s
                 AND COALESCE(product_name,'') = COALESCE(%s,'')
                 AND COALESCE(upc,'') = COALESCE(%s,'')
+                AND monitoring = %s
                 AND status = 'active'""",
-                (user["user_id"], brand, product_name, upc))
+                (user["user_id"], brand, product_name, upc, body.monitoring))
             existing = c.fetchone()
             if existing:
                 return {"id": existing[0], "duplicate": True}
