@@ -27,7 +27,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 OPENFDA_KEY = os.environ.get("OPENFDA_KEY", "")
 USDA_FDC_KEY = os.environ.get("USDA_FDC_KEY", "")
 
-API_VERSION = "0.1.10"
+API_VERSION = "0.1.11"
 JWT_ALGO = "HS256"
 JWT_EXPIRY_DAYS = 7
 INGEST_WINDOW_DAYS = 90
@@ -783,6 +783,35 @@ async def admin_run_watchlist_check(_admin=Depends(require_admin)):
     """Manual trigger of the watchlist check (also runs on cron)."""
     run_watchlist_check()
     return {"status": "ok", "ts": datetime.utcnow().isoformat()}
+
+
+@app.get("/admin/signup-stats")
+async def admin_signup_stats(x_admin_token: str = Header(None, alias="X-Admin-Token")):
+    """Read-only signup metrics for the 3Brains scoreboard.
+    Requires X-Admin-Token header matching ADMIN_STATS_TOKEN env var."""
+    expected = os.environ.get("ADMIN_STATS_TOKEN")
+    if not expected or x_admin_token != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total_users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")
+        signups_24h = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '7 days'")
+        signups_7d = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '30 days'")
+        signups_30d = c.fetchone()[0]
+        c.execute("SELECT MAX(created_at) FROM users")
+        latest_row = c.fetchone()
+        latest = latest_row[0].isoformat() if latest_row and latest_row[0] else None
+        return {
+            "total_users": total_users,
+            "signups_24h": signups_24h,
+            "signups_7d": signups_7d,
+            "signups_30d": signups_30d,
+            "latest_signup_at": latest
+        }
 
 
 # ── STARTUP ───────────────────────────────────────────────────────────────────
